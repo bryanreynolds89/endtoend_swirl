@@ -1,7 +1,8 @@
 import openai
 from langsmith import traceable, get_current_run_tree
 from qdrant_client import QdrantClient
-from qdrant_client.models import Prefetch, FusionQuery, Document
+from qdrant_client.models import Prefetch, FusionQuery, Document, Filter, FieldCondition, MatchAny
+
 
 
 @traceable(
@@ -22,15 +23,18 @@ def get_embedding(text, model="text-embedding-3-small"):
             "input_tokens": response.usage.prompt_tokens,
             "total_tokens": response.usage.total_tokens,
         }
-    
+
     return response.data[0].embedding
+
+
+### Item Description Retrieval Tool
 
 
 @traceable(
     name="retrieve_data",
     run_type="retriever"
 )
-def retrieve_data(query, qdrant_client, k=5):
+def retrieve_items_data(query, k=5):
 
     query_embedding = get_embedding(query)
 
@@ -77,10 +81,10 @@ def retrieve_data(query, qdrant_client, k=5):
 
 
 @traceable(
-    name="format_retieve_context",
+    name="format_retrieved_context",
     run_type="prompt"
 )
-def process_context(context):
+def process_items_context(context):
 
     formatted_context = ""
 
@@ -90,7 +94,7 @@ def process_context(context):
     return formatted_context
 
 
-def get_formatted_context(query: str, top_k: int = 5) -> str:
+def get_formatted_items_context(query: str, top_k: int = 5) -> str:
 
     """Get the top k context, each representing an inventory item for a given query.
     
@@ -102,8 +106,91 @@ def get_formatted_context(query: str, top_k: int = 5) -> str:
         A string of the top k context chunks with IDs and average ratings prepending each chunk, each representing an inventory item for a given query.
     """
 
-    context = retrieve_data(query, top_k)
-    formatted_context = process_context(context)
+    context = retrieve_items_data(query, top_k)
+    formatted_context = process_items_context(context)
 
     return formatted_context
 
+
+### Item Reviews Retrieval Tool
+
+
+@traceable(
+    name="retrieve_reviews_data",
+    run_type="retriever"
+)
+def retrieve_reviews_data(query, item_list, k=5):
+
+    query_embedding = get_embedding(query)
+
+    qdrant_client = QdrantClient(url="http://qdrant:6333")
+
+    results = qdrant_client.query_points(
+        collection_name="Amazon-items-collection-01-reviews",
+        prefetch=[
+            Prefetch(
+                query=query_embedding,
+                filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="parent_asin",
+                            match=MatchAny(
+                                any=item_list
+                            )
+                        )
+                    ]
+                ),
+                limit=20
+            )
+        ],
+        query=FusionQuery(fusion="rrf"),
+        limit=k
+    )
+
+    retrieved_context_ids = []
+    retrieved_context = []
+    similarity_scores = []
+
+    for result in results.points:
+        retrieved_context_ids.append(result.payload["parent_asin"])
+        retrieved_context.append(result.payload["text"])
+        similarity_scores.append(result.score)
+
+    return {
+        "retrieved_context_ids": retrieved_context_ids,
+        "retrieved_context": retrieved_context,
+        "similarity_scores": similarity_scores,
+    }
+
+
+@traceable(
+    name="format_retrieved_reviews_context",
+    run_type="prompt"
+)
+def process_reviews_context(context):
+
+    formatted_context = ""
+
+    for id, chunk in zip(context["retrieved_context_ids"], context["retrieved_context"]):
+        formatted_context += f"- ID: {id}, review: {chunk}\n"
+
+    return formatted_context
+
+
+def get_formatted_reviews_context(query: str, item_list: list, top_k: int = 15) -> str:
+
+    """Get the top k reviews matching a query for a list of prefiltered items.
+    
+    Args:
+        query: The query to get the top k reviews for
+        item_list: The list of item IDs to prefilter for before running the query
+        top_k: The number of reviews to retrieve, this should be at least 20 if multipple items are prefiltered
+    
+    Returns:
+        A string of the top k context chunks with IDs prepending each chunk, each representing a review for a given inventory item for a given query.
+    """
+
+    context = retrieve_reviews_data(query, item_list, top_k)
+    formatted_context = process_reviews_context(context)
+
+    return formatted_context
