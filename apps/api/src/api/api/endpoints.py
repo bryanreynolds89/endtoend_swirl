@@ -43,5 +43,5 @@ def send_feedback(
 
 
 api_router = APIRouter()
-api_router.include_router(rag_router, prefix="/rag", tags=["rag"])
+api_router.include_router(rag_router, prefix="/agent", tags=["agent"])
 api_router.include_router(feedback_router, prefix="/submit_feedback", tags=["feedback"])

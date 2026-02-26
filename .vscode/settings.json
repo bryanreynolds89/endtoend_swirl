@@ -1,0 +1,13 @@
+{
+  "python.analysis.extraPaths": [
+    "apps/api/src",
+    "apps/chatbot_ui/src"
+  ],
+  "python-envs.pythonProjects": [
+    {
+      "path": "",
+      "envManager": "ms-python.python:system",
+      "packageManager": "ms-python.python:pip"
+    }
+  ]
+}

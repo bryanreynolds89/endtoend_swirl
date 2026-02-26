@@ -57,9 +57,7 @@ def api_call(method, url, **kwargs):
 
 
 def api_call_stream(method, url, **kwargs):
-
     def _show_error_popup(message):
-        """Show error message as a popup in the top-right corner."""
         st.session_state["error_popup"] = {
             "visible": True,
             "message": message,
@@ -67,43 +65,48 @@ def api_call_stream(method, url, **kwargs):
 
     try:
         response = getattr(requests, method)(url, **kwargs)
-
+        response.raise_for_status()
         return response.iter_lines()
 
     except requests.exceptions.ConnectionError:
         _show_error_popup("Connection error. Please check your network connection.")
-        return False, {"message": "Connection error"}
+        return iter([])
+
     except requests.exceptions.Timeout:
         _show_error_popup("The request timed out. Please try again later.")
-        return False, {"message": "Request timeout"}
+        return iter([])
+
+    except requests.exceptions.HTTPError as e:
+        _show_error_popup(f"HTTP error: {str(e)}")
+        return iter([])
+
     except Exception as e:
         _show_error_popup(f"An unexpected error occurred: {str(e)}")
-        return False, {"message": str(e)}
+        return iter([])
 
 
 def submit_feedback(feedback_type=None, feedback_text=""):
-    """Submit feedback to the API endpoint"""
-
     def _feedback_score(feedback_type):
         if feedback_type == "positive":
             return 1
         elif feedback_type == "negative":
             return 0
-        else:
-            return None 
-    
+        return None
+
+    trace_id = st.session_state.get("trace_id")
+    if not trace_id:
+        return False, {"message": "trace_id is missing. Feedback can only be sent after an agent response is received."}
+
     feedback_data = {
         "feedback_score": _feedback_score(feedback_type),
         "feedback_text": feedback_text,
-        "trace_id": st.session_state.trace_id,
+        "trace_id": trace_id,
         "thread_id": session_id,
-        "feedback_source_type": "api"
+        "feedback_source_type": "api",
     }
 
     logger.info(f"Feedback data: {feedback_data}")
-    
-    status, response = api_call("post", f"{config.API_URL}/submit_feedback", json=feedback_data)
-    return status, response
+    return api_call("post", f"{config.API_URL}/submit_feedback/", json=feedback_data)
 
 
 if "messages" not in st.session_state:
@@ -111,6 +114,9 @@ if "messages" not in st.session_state:
 
 if "used_context" not in st.session_state:
     st.session_state.used_context = []
+
+if "shopping_cart" not in st.session_state:
+    st.session_state.shopping_cart = []
 
 
 # Initialize feedback states (simplified)
@@ -128,20 +134,60 @@ if "trace_id" not in st.session_state:
 
 
 with st.sidebar:
-    # Create tabs in the sidebar
-    suggestions_tab, = st.tabs(["🔍 Suggestions"])
-    
-    # Suggestions Tab
+    suggestions_tab, shopping_cart_tab = st.tabs(["🔍 Suggestions", "🛒 Shopping Cart"])
+
     with suggestions_tab:
         if st.session_state.used_context:
-            for idx, item in enumerate(st.session_state.used_context):
-                st.caption(item.get('description', 'No description'))
-                if 'image_url' in item:
-                    st.image(item["image_url"], width=250)
-                st.caption(f"Price: {item['price']} USD")
+            for item in st.session_state.used_context:
+                desc = item.get("description") or item.get("product_id") or "No description"
+                st.caption(desc)
+
+                img = item.get("image_url")
+                if img:
+                    st.image(img, width=250)
+                else:
+                    st.caption("No image available")
+
+                price = item.get("price")
+                currency = item.get("currency") or "USD"
+
+                if price not in (None, ""):
+                    st.caption(f"Price: {price} {currency}")
+                else:
+                    st.caption(f"Price: N/A {currency}")
+
                 st.divider()
         else:
             st.info("No suggestions yet")
+
+    with shopping_cart_tab:
+        if st.session_state.shopping_cart:
+            for item in st.session_state.shopping_cart:
+                desc = item.get("description") or item.get("product_id") or "No description"
+                st.caption(desc)
+
+                img = item.get("product_image_url")
+                if img:
+                    st.image(img, width=250)
+                else:
+                    st.caption("No image available")
+
+                price = item.get("price")
+                currency = item.get("currency") or "USD"
+                quantity = item.get("quantity")
+                total_price = item.get("total_price")
+
+                st.caption(f"Price: {price} {currency}" if price not in (None, "") else f"Price: N/A {currency}")
+                st.caption(f"Quantity: {quantity}" if quantity not in (None, "") else "Quantity: N/A")
+                st.caption(
+                    f"Total price: {total_price} {currency}"
+                    if total_price not in (None, "")
+                    else f"Total price: N/A {currency}"
+                )
+
+                st.divider()
+        else:
+            st.info("Your cart is empty")
 
 
 for idx, message in enumerate(st.session_state.messages):
@@ -159,22 +205,35 @@ for idx, message in enumerate(st.session_state.messages):
             # Use Streamlit's built-in feedback component
             feedback_key = f"feedback_{len(st.session_state.messages)}"
             feedback_result = st.feedback("thumbs", key=feedback_key)
+
+            msg_id = len(st.session_state.messages) - 1
+            sent_key = f"feedback_sent_{msg_id}"
+            if sent_key not in st.session_state:
+                st.session_state[sent_key] = False
             
             # Handle feedback selection
             if feedback_result is not None:
                 feedback_type = "positive" if feedback_result == 1 else "negative"
                 
                 # Only submit if this is a new/different feedback
-                if st.session_state.latest_feedback != feedback_type:
+                if not st.session_state[sent_key] and st.session_state.latest_feedback != feedback_type:
                     with st.spinner("Submitting feedback..."):
                         status, response = submit_feedback(feedback_type=feedback_type)
-                        if status:
-                            st.session_state.latest_feedback = feedback_type
-                            st.session_state.feedback_submission_status = "success"
-                            st.session_state.show_feedback_box = (feedback_type == "negative")
-                        else:
-                            st.session_state.feedback_submission_status = "error"
-                            st.error("Failed to submit feedback. Please try again.")
+
+                    if status:
+                        st.session_state[sent_key] = True
+
+                    if status:
+                        st.session_state.latest_feedback = feedback_type
+                        st.session_state.feedback_submission_status = "success"
+                        st.session_state.show_feedback_box = (feedback_type == "negative")
+                    else:
+                        st.session_state.feedback_submission_status = "error"
+                        # optionally show server message:
+                        err = response.get("detail") or response.get("message") or str(response)
+                        st.session_state.feedback_last_error = err
+                        st.error(err)
+
                     st.rerun()
             
             # Show feedback status message
@@ -184,7 +243,7 @@ for idx, message in enumerate(st.session_state.messages):
                 elif st.session_state.latest_feedback == "negative" and not st.session_state.show_feedback_box:
                     st.success("✅ Thank you for your feedback!")
             elif st.session_state.feedback_submission_status == "error":
-                st.error("❌ Failed to submit feedback. Please try again.")
+                st.error(st.session_state.get("feedback_last_error", "Failed to submit feedback."))
             
             # Show feedback text box if thumbs down was pressed
             if st.session_state.show_feedback_box:
@@ -232,15 +291,22 @@ if prompt := st.chat_input("Hello! How can I assist you today?"):
         message_placeholder = st.empty()
 
         for line in api_call_stream(
-            "post", 
-            f"{config.API_URL}/rag", 
+            "post",
+            f"{config.API_URL}/agent",
             json={"query": prompt, "thread_id": session_id},
             stream=True,
-            headers={"Accept": "text/event-stream"}
+            headers={"Accept": "text/event-stream"},
         ):
-            line_text = line.decode("utf-8")
+            if not line:
+                continue
+
+            if isinstance(line, bytes):
+                line_text = line.decode("utf-8", errors="replace")
+            else:
+                line_text = str(line)
+
             if line_text.startswith("data: "):
-                data = line_text[6:]
+                data = line_text[6:]    
 
                 try:
                     output = json.loads(data)
@@ -249,10 +315,17 @@ if prompt := st.chat_input("Hello! How can I assist you today?"):
                         answer = output["data"]["answer"]
                         used_context = output["data"]["used_context"]
                         trace_id = output["data"]["trace_id"]
+                        shopping_cart = output["data"]["shopping_cart"]
                         
+                        logger.info(f"shopping_cart payload: {shopping_cart}")
+
                         st.session_state.used_context = used_context
                         st.session_state.messages.append({"role": "assistant", "content": answer})
-                        st.session_state.trace_id = trace_id
+                        if trace_id:
+                            st.session_state.trace_id = trace_id
+                        else:
+                            logger.warning("Agent final_result contained empty trace_id")
+                        st.session_state.shopping_cart = shopping_cart
 
                         st.session_state.latest_feedback = None
                         st.session_state.show_feedback_box = False
